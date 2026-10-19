@@ -1,0 +1,122 @@
+{
+  "name": "revibe-media-centre",
+  "version": "1.0.3",
+  "description": "A local-first media centre for music, video and public TV streams.",
+  "main": "electron/main.cjs",
+  "author": "Revibe Media Centre",
+  "license": "GPL-3.0-only",
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build:web": "vite build",
+    "start": "electron .",
+    "postinstall": "node node_modules/electron/install.js && node scripts/copy-hls.cjs",
+    "copy:hls": "node scripts/copy-hls.cjs",
+    "check": "node scripts/check-source.cjs",
+    "portable:win": "npm run check && npm run copy:hls && electron-builder --win portable --x64",
+    "installer:win": "npm run check && npm run copy:hls && electron-builder --win nsis --x64",
+    "build:win": "npm run check && npm run copy:hls && electron-builder --win --x64 --dir"
+  },
+  "devDependencies": {
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3",
+    "hls.js": "1.7.3",
+    "vite": "6.4.4"
+  },
+  "build": {
+    "appId": "com.revibemediacentre.app",
+    "productName": "Revibe Media Centre",
+    "asar": true,
+    "electronLanguages": [
+      "en-US"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "assets/**/*",
+      "index.html",
+      "package.json",
+      "LICENSE",
+      "LICENSES/**/*",
+      "THIRD-PARTY-NOTICES.md"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.cjs"
+    },
+    "win": {
+      "target": [
+        "dir"
+      ],
+      "icon": "assets/app-icon.ico",
+      "artifactName": "Revibe-Media-Centre-${version}-win-x64.${ext}",
+      "requestedExecutionLevel": "asInvoker",
+      "signExecutable": false,
+      "fileAssociations": [
+        {
+          "ext": [
+            "mp3",
+            "m4a",
+            "aac",
+            "wav",
+            "flac",
+            "ogg",
+            "oga",
+            "opus",
+            "wma",
+            "aiff",
+            "aif",
+            "ape",
+            "alac"
+          ],
+          "name": "RevibeAudio",
+          "description": "Audio files supported by Revibe Media Centre",
+          "icon": "assets/app-icon.ico"
+        },
+        {
+          "ext": [
+            "mp4",
+            "m4v",
+            "mkv",
+            "webm",
+            "mov",
+            "avi",
+            "wmv",
+            "mpeg",
+            "mpg",
+            "3gp",
+            "ts",
+            "m2ts"
+          ],
+          "name": "RevibeVideo",
+          "description": "Video files supported by Revibe Media Centre",
+          "icon": "assets/app-icon.ico"
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "Revibe-Media-Centre-${version}-Portable.${ext}"
+    },
+    "nsis": {
+      "artifactName": "Revibe-Media-Centre-${version}-Setup.${ext}",
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Revibe Media Centre",
+      "deleteAppDataOnUninstall": false,
+      "license": "LICENSE",
+      "runAfterFinish": true
+    }
+  },
+  "dependencies": {
+    "music-metadata": "^11.16.1"
+  }
+}
