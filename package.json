@@ -1,6 +1,6 @@
 {
   "name": "revibe-media-centre",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "A local-first media centre for music, video and public TV streams.",
   "main": "electron/main.cjs",
   "author": "Revibe Media Centre",

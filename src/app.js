@@ -114,6 +114,10 @@
   let tvChannels = [];
   let tvFetchInfo = { fetchedAt: 0, stale: false, error: '' };
   let itemLookup = new Map();
+  let stageListsInitialized = false;
+  let lastStageSelectionKey = '';
+  let lastStageItemType = '';
+  let lastStagePlaying = false;
   let fallbackPickKind = 'music';
   let fallbackPickPurpose = 'queue';
   let audioContext = null;
@@ -125,13 +129,13 @@
   let reverbConvolver = null;
   let reverbDryGain = null;
   let reverbWetGain = null;
+  let reverbReleaseTimer = 0;
   let musicTransition = null;
   let activeMusicDeckIndex = 0;
   let musicDeckLevels = [1, 0];
   let tvHls = null;
   let hlsFailReported = false;
   let dragCounter = 0;
-  let pendingConfirm = null;
   let settingsSaveTimer = 0;
   let visualizerFrameRequest = 0;
   let visualizerTimer = 0;
@@ -150,8 +154,25 @@
   const artworkRequests = new Set();
   const failedArtworkItems = new Set();
   const observedArtworkNodes = new WeakSet();
+  const artworkObserverTargets = new WeakSet();
+  const localArtworkScanned = new Map();
+  const localArtworkQueued = new Set();
+  const localArtworkQueue = [];
+  let localArtworkWorkers = 0;
+  let localArtworkBatchPending = false;
+  let artworkCachePersistTimer = 0;
+  let artworkStatePersistTimer = 0;
+  const MAX_ITEM_LOOKUP_ENTRIES = 12000;
+  const MAX_ARTWORK_SEARCH_CACHE_ENTRIES = 1200;
+  const MAX_LOCAL_ARTWORK_SCANNED = 12000;
+  const MAX_LOCAL_ARTWORK_WORKERS = 3;
   let artworkSearchCache = safeStorageRead('revibe.artwork-cache.v1', {});
   if (!artworkSearchCache || typeof artworkSearchCache !== 'object' || Array.isArray(artworkSearchCache)) artworkSearchCache = {};
+  const cachedArtworkIds = Object.keys(artworkSearchCache);
+  if (cachedArtworkIds.length > MAX_ARTWORK_SEARCH_CACHE_ENTRIES) {
+    for (const id of cachedArtworkIds.slice(0, cachedArtworkIds.length - MAX_ARTWORK_SEARCH_CACHE_ENTRIES)) delete artworkSearchCache[id];
+    safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+  }
 
   const audio = byId('audioPlayer');
   const audioSecondary = byId('audioPlayerSecondary');
@@ -376,6 +397,39 @@
     if (reverbValue) reverbValue.textContent = `${settings.reverbAmount}%`;
   }
 
+  function ensureReverbEffect() {
+    if (!audioContext || !analyser || reverbConvolver) return;
+    let convolver = null;
+    let wetGain = null;
+    try {
+      convolver = audioContext.createConvolver();
+      convolver.buffer = createReverbImpulse(audioContext);
+      wetGain = audioContext.createGain();
+      wetGain.gain.value = 0;
+      analyser.connect(convolver);
+      convolver.connect(wetGain);
+      wetGain.connect(audioContext.destination);
+      reverbConvolver = convolver;
+      reverbWetGain = wetGain;
+    } catch {
+      try { analyser.disconnect(convolver); } catch { /* graph setup may not have reached this edge */ }
+      try { convolver?.disconnect(); } catch { /* ignore partial graph cleanup */ }
+      try { wetGain?.disconnect(); } catch { /* ignore partial graph cleanup */ }
+    }
+  }
+
+  function releaseReverbEffect() {
+    if (!reverbConvolver) return;
+    const convolver = reverbConvolver;
+    const wetGain = reverbWetGain;
+    reverbConvolver = null;
+    reverbWetGain = null;
+    try { analyser?.disconnect(convolver); } catch { /* retain the dry analyzer connection */ }
+    try { convolver.disconnect(); } catch { /* effect is already disconnected */ }
+    try { convolver.buffer = null; } catch { /* release whatever the browser allows */ }
+    try { wetGain?.disconnect(); } catch { /* effect is already disconnected */ }
+  }
+
   function applyAudioSettings() {
     if (!audioContext) return;
     const preset = EQ_PRESETS[settings.equalizerPreset] || EQ_PRESETS.balanced;
@@ -384,14 +438,26 @@
       const gain = settings.equalizerEnabled ? preset.gains[index] || 0 : 0;
       try { filter.gain.setTargetAtTime(gain, now, .035); } catch { filter.gain.value = gain; }
     });
-    if (reverbWetGain && reverbDryGain) {
-      const mix = settings.reverbEnabled ? Math.max(0, Math.min(60, Number(settings.reverbAmount) || 0)) / 100 : 0;
+    if (settings.reverbEnabled) {
+      window.clearTimeout(reverbReleaseTimer);
+      reverbReleaseTimer = 0;
+      ensureReverbEffect();
+    }
+    if (reverbDryGain) {
+      const effectReady = Boolean(settings.reverbEnabled && reverbConvolver && reverbWetGain);
+      const mix = effectReady ? Math.max(0, Math.min(60, Number(settings.reverbAmount) || 0)) / 100 : 0;
       try {
         reverbDryGain.gain.setTargetAtTime(1 - mix * .22, now, .05);
-        reverbWetGain.gain.setTargetAtTime(mix * .72, now, .05);
+        if (reverbWetGain) reverbWetGain.gain.setTargetAtTime(mix * .72, now, .05);
       } catch {
         reverbDryGain.gain.value = 1 - mix * .22;
-        reverbWetGain.gain.value = mix * .72;
+        if (reverbWetGain) reverbWetGain.gain.value = mix * .72;
+      }
+      if (!settings.reverbEnabled && reverbConvolver && !reverbReleaseTimer) {
+        reverbReleaseTimer = window.setTimeout(() => {
+          reverbReleaseTimer = 0;
+          if (!settings.reverbEnabled) releaseReverbEffect();
+        }, 300);
       }
     }
   }
@@ -458,12 +524,92 @@
     if (item.type === 'tv') return [item.country === 'PH' ? 'Philippines' : item.country, item.category || 'Live channel'].filter(Boolean).join(' · ');
     return item.artist || item.folder || item.extension || typeLabel(item.type);
   }
+  function trimItemLookup(keepId) {
+    const liveIds = new Set();
+    if (currentItem) liveIds.add(mediaId(currentItem));
+    document.querySelectorAll('[data-item-id], [data-artwork-item-id]').forEach((node) => {
+      if (node.dataset.itemId) liveIds.add(node.dataset.itemId);
+      if (node.dataset.artworkItemId) liveIds.add(node.dataset.artworkItemId);
+    });
+    for (const id of itemLookup.keys()) {
+      if (id !== keepId && !liveIds.has(id)) itemLookup.delete(id);
+    }
+  }
+
   function cacheItem(item) {
     if (!item || typeof item !== 'object') return '';
     const id = mediaId(item);
     item.id = id;
     itemLookup.set(id, item);
+    if (itemLookup.size > MAX_ITEM_LOOKUP_ENTRIES) trimItemLookup(id);
     return id;
+  }
+
+  function scheduleArtworkCachePersist() {
+    if (artworkCachePersistTimer) return;
+    artworkCachePersistTimer = window.setTimeout(() => {
+      artworkCachePersistTimer = 0;
+      safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+    }, 350);
+  }
+
+  function scheduleArtworkStatePersist() {
+    if (artworkStatePersistTimer) return;
+    artworkStatePersistTimer = window.setTimeout(() => {
+      artworkStatePersistTimer = 0;
+      persistState();
+    }, 500);
+  }
+
+  function localArtworkStamp(item) {
+    return `${Number(item?.size) || 0}:${Number(item?.modified) || 0}`;
+  }
+
+  function hasLocalArtworkScanned(item) {
+    return item?._artworkLocalStamp === localArtworkStamp(item);
+  }
+
+  function wasLocalArtworkScanned(id, item) {
+    return localArtworkScanned.get(id) === localArtworkStamp(item) || hasLocalArtworkScanned(item);
+  }
+
+  function markLocalArtworkScanned(id, item) {
+    if (!id) return;
+    const stamp = localArtworkStamp(item);
+    localArtworkScanned.delete(id);
+    localArtworkScanned.set(id, stamp);
+    if (localArtworkScanned.size > MAX_LOCAL_ARTWORK_SCANNED) {
+      localArtworkScanned.delete(localArtworkScanned.keys().next().value);
+    }
+    if (item && typeof item === 'object') item._artworkLocalStamp = stamp;
+    if (currentItem && mediaId(currentItem) === id) currentItem._artworkLocalStamp = stamp;
+  }
+
+  function normalizeArtworkUrl(value) {
+    return typeof value === 'string' && /^(https?:|file:|revibe:|data:)/i.test(value) ? value : '';
+  }
+
+  function setArtworkUrlForId(id, item, url) {
+    if (item && typeof item === 'object') item.artworkUrl = url;
+    const lists = [state.musicQueue, state.library?.music, state.recentPlayed, state.newlyAdded];
+    for (const list of lists) {
+      if (!Array.isArray(list)) continue;
+      for (const candidate of list) {
+        if (candidate && mediaId(candidate) === id) candidate.artworkUrl = url;
+      }
+    }
+    if (currentItem && mediaId(currentItem) === id) currentItem.artworkUrl = url;
+  }
+
+  function cacheArtworkResult(id, value, persist = true) {
+    delete artworkSearchCache[id];
+    artworkSearchCache[id] = value;
+    const ids = Object.keys(artworkSearchCache);
+    if (ids.length > MAX_ARTWORK_SEARCH_CACHE_ENTRIES) {
+      for (const staleId of ids.slice(0, ids.length - MAX_ARTWORK_SEARCH_CACHE_ENTRIES)) delete artworkSearchCache[staleId];
+    }
+    if (persist) safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+    else scheduleArtworkCachePersist();
   }
 
   function artworkUrlFor(item) {
@@ -482,33 +628,55 @@
     return url ? `<img class="artwork-image" src="${esc(url)}" alt="" loading="lazy" decoding="async">` : '';
   }
 
+  function vinylArtworkMarkup() {
+    return '<span class="vinyl-art" aria-hidden="true"><span class="vinyl-record"><span class="vinyl-label"><span class="vinyl-spindle"></span></span></span></span>';
+  }
+
+  function artworkFallbackMarkup(item, style = 'icon') {
+    const type = item?.type || 'music';
+    if (type === 'music') return vinylArtworkMarkup();
+    const symbol = icon(typeIcon(type));
+    return style === 'symbol' ? `<span class="art-symbol">${symbol}</span>` : `<span class="icon-slot">${symbol}</span>`;
+  }
+
   function attachArtworkErrorHandler(image) {
-    if (observedArtworkNodes.has(image)) return;
-    observedArtworkNodes.add(image);
-    image.addEventListener('error', () => {
-      const host = image.closest('[data-artwork-item-id]');
-      if (!host) { image.remove(); return; }
-      const id = host.dataset.artworkItemId;
-      const item = itemLookup.get(id);
-      image.remove();
-      host.classList.remove('has-artwork');
-      if (!item || failedArtworkItems.has(id)) return;
-      failedArtworkItems.add(id);
-      if (item.artworkUrl === image.src || item.logo === image.src || item.poster === image.src) {
-        delete item.artworkUrl;
-        delete item.logo;
-        delete item.poster;
-      }
-      delete artworkSearchCache[id];
-      safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
-      void requestArtwork(item, true);
-    }, { once: true });
+    if (!image) return;
+    if (!observedArtworkNodes.has(image)) {
+      observedArtworkNodes.add(image);
+      image.addEventListener('load', () => {
+        if (image.naturalWidth > 0) image.closest('[data-artwork-item-id]')?.classList.add('artwork-loaded');
+      });
+      image.addEventListener('error', () => {
+        const host = image.closest('[data-artwork-item-id]');
+        if (!host) { image.remove(); return; }
+        const id = host.dataset.artworkItemId;
+        const item = itemLookup.get(id);
+        const failedUrl = image.currentSrc || image.src;
+        image.remove();
+        host.classList.remove('has-artwork', 'artwork-loaded');
+        if (!item) return;
+        if ([item.artworkUrl, item.logo, item.poster].some((url) => url === failedUrl || url === image.src)) {
+          delete item.artworkUrl;
+          delete item.logo;
+          delete item.poster;
+        }
+        delete artworkSearchCache[id];
+        safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+        if (failedArtworkItems.has(id)) return;
+        failedArtworkItems.add(id);
+        void requestArtwork(item, true);
+      });
+    }
+    if (image.complete && image.naturalWidth > 0) {
+      image.closest('[data-artwork-item-id]')?.classList.add('artwork-loaded');
+    }
   }
 
   function updateArtworkNodes(id, item, url) {
     document.querySelectorAll('[data-artwork-item-id]').forEach((host) => {
       if (host.dataset.artworkItemId !== id) return;
       host.classList.toggle('has-artwork', Boolean(url));
+      host.classList.remove('artwork-loaded');
       let image = host.querySelector(':scope > img.artwork-image');
       if (!url) { image?.remove(); return; }
       if (!image) {
@@ -521,6 +689,7 @@
       }
       attachArtworkErrorHandler(image);
       if (image.src !== url) image.src = url;
+      if (image.complete && image.naturalWidth > 0) host.classList.add('artwork-loaded');
     });
     if (currentItem && mediaId(currentItem) === id) {
       if (item.type === 'video' && video) video.poster = url || '';
@@ -538,72 +707,186 @@
     artworkRequests.add(id);
     try {
       let url = '';
-      if (!forceSearch && item.path && bridge.getMediaArtwork) url = await bridge.getMediaArtwork(item.path, item.type);
+      if (!forceSearch && item.path && bridge.getMediaArtwork && !wasLocalArtworkScanned(id, item)) {
+        markLocalArtworkScanned(id, item);
+        url = await bridge.getMediaArtwork(item.path, item.type);
+        scheduleArtworkStatePersist();
+      }
       if (!url && bridge.searchArtwork) url = await bridge.searchArtwork({
         type: item.type, title: titleFor(item), name: item.name || '', artist: item.artist || '', country: item.country || '', site: item.site || ''
       });
-      if (typeof url !== 'string' || !/^(https?:|file:|revibe:|data:)/i.test(url)) url = '';
-      artworkSearchCache[id] = url || false;
+      url = normalizeArtworkUrl(url);
+      cacheArtworkResult(id, url || false);
       if (url) item.artworkUrl = url;
-      safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
       if (url) {
         updateArtworkNodes(id, item, url);
         persistState();
       }
     } catch {
-      artworkSearchCache[id] = false;
-      safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+      cacheArtworkResult(id, false);
     } finally { artworkRequests.delete(id); }
+  }
+
+  function scheduleLocalArtworkPrefetch(items) {
+    if (!bridge.getMediaArtwork || !Array.isArray(items)) return;
+    let added = false;
+    for (const item of items) {
+      if (item?.type !== 'music' || typeof item.path !== 'string' || !item.path) continue;
+      const id = mediaId(item);
+      if (wasLocalArtworkScanned(id, item) || localArtworkQueued.has(id) || artworkRequests.has(id)) continue;
+      localArtworkQueued.add(id);
+      localArtworkQueue.push({ id, item });
+      added = true;
+    }
+    if (added) localArtworkBatchPending = true;
+    drainLocalArtworkQueue();
+  }
+
+  function drainLocalArtworkQueue() {
+    while (localArtworkWorkers < MAX_LOCAL_ARTWORK_WORKERS && localArtworkQueue.length) {
+      const { id, item } = localArtworkQueue.shift();
+      localArtworkQueued.delete(id);
+      if (!item || wasLocalArtworkScanned(id, item) || artworkRequests.has(id)) continue;
+      markLocalArtworkScanned(id, item);
+      artworkRequests.add(id);
+      localArtworkWorkers += 1;
+      void (async () => {
+        try {
+          const url = normalizeArtworkUrl(await bridge.getMediaArtwork(item.path, 'music'));
+          if (url) {
+            setArtworkUrlForId(id, item, url);
+            cacheArtworkResult(id, url, false);
+            updateArtworkNodes(id, item, url);
+          }
+        } catch { /* Keep the Fluent vinyl fallback if a local file cannot be read. */ }
+        finally {
+          scheduleArtworkStatePersist();
+          artworkRequests.delete(id);
+          localArtworkWorkers -= 1;
+          drainLocalArtworkQueue();
+        }
+      })();
+    }
+    if (!localArtworkQueue.length && !localArtworkWorkers && localArtworkBatchPending) {
+      localArtworkBatchPending = false;
+      watchArtwork();
+    }
+  }
+
+  function scheduleDetectedMusicArtwork(extraItems = []) {
+    const items = [
+      ...(currentItem?.type === 'music' ? [currentItem] : []),
+      ...(state.musicQueue || []),
+      ...(state.library?.music || []),
+      ...(state.recentPlayed || []),
+      ...(state.newlyAdded || []),
+      ...(Array.isArray(extraItems) ? extraItems : [])
+    ];
+    scheduleLocalArtworkPrefetch(items);
+  }
+
+  function resetStaleMusicArtworkOnce() {
+    const migrationKey = 'revibe.artwork-recovery.v1';
+    if (safeStorageRead(migrationKey, '') === 'done') return;
+    const items = [
+      ...(state.musicQueue || []),
+      ...(state.library?.music || []),
+      ...(state.recentPlayed || []),
+      ...(state.newlyAdded || []),
+      ...(currentItem?.type === 'music' ? [currentItem] : [])
+    ];
+    const ids = new Set();
+    for (const item of items) {
+      if (item?.type !== 'music') continue;
+      ids.add(mediaId(item));
+      delete item.artworkUrl;
+      delete item.logo;
+      delete item.poster;
+      delete item._artworkLocalStamp;
+    }
+    for (const id of ids) delete artworkSearchCache[id];
+    safeStorageWrite('revibe.artwork-cache.v1', artworkSearchCache);
+    const previousPage = currentPage;
+    currentPage = ['home', 'music', 'video', 'tv', 'devices', 'settings'].includes(state.lastPage) ? state.lastPage : 'home';
+    persistState();
+    currentPage = previousPage;
+    safeStorageWrite(migrationKey, 'done');
+  }
+
+  function unwatchArtwork(root) {
+    if (!root || !artworkObserver) return;
+    const nodes = [];
+    if (root.matches?.('[data-artwork-item-id]')) nodes.push(root);
+    nodes.push(...root.querySelectorAll?.('[data-artwork-item-id]') || []);
+    for (const node of nodes) {
+      artworkObserver.unobserve(node);
+      artworkObserverTargets.delete(node);
+    }
   }
 
   function watchArtwork(root = document) {
     if (!root) return;
+    if (root.nodeType === 1 && root.closest('.page')?.hidden) return;
     const nodes = [];
     if (root.matches?.('[data-artwork-item-id]')) nodes.push(root);
     nodes.push(...root.querySelectorAll?.('[data-artwork-item-id]') || []);
     const images = [];
     if (root.matches?.('img.artwork-image')) images.push(root);
     images.push(...root.querySelectorAll?.('img.artwork-image') || []);
-    images.forEach(attachArtworkErrorHandler);
+    images.forEach((image) => { if (!image.closest('.page')?.hidden) attachArtworkErrorHandler(image); });
     for (const node of nodes) {
-      const item = itemLookup.get(node.dataset.artworkItemId);
-      if (!item || artworkUrlFor(item) || artworkRequests.has(node.dataset.artworkItemId)) continue;
-      if (Object.prototype.hasOwnProperty.call(artworkSearchCache, node.dataset.artworkItemId) && artworkSearchCache[node.dataset.artworkItemId] === false) continue;
+      if (node.closest('.page')?.hidden) continue;
+      const id = node.dataset.artworkItemId;
+      const item = itemLookup.get(id);
+      if (!item || artworkUrlFor(item) || artworkRequests.has(id) || localArtworkQueued.has(id)) continue;
+      if (Object.prototype.hasOwnProperty.call(artworkSearchCache, id) && artworkSearchCache[id] === false) continue;
       if (typeof IntersectionObserver !== 'function') { void requestArtwork(item); continue; }
       if (!artworkObserver) artworkObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
           artworkObserver.unobserve(entry.target);
+          artworkObserverTargets.delete(entry.target);
           const visibleItem = itemLookup.get(entry.target.dataset.artworkItemId);
           if (visibleItem) void requestArtwork(visibleItem);
         }
       }, { root: null, rootMargin: '100px' });
-      if (observedArtworkNodes.has(node)) continue;
-      observedArtworkNodes.add(node);
+      if (artworkObserverTargets.has(node)) continue;
+      artworkObserverTargets.add(node);
       artworkObserver.observe(node);
     }
   }
 
-  function artMarkup(item, wide = true) {
+  function artMarkup(item) {
     const type = item?.type || 'music';
     const className = artClass(type);
     const duration = item?.duration ? formatTime(item.duration) : (item?.extension || typeLabel(type)).toUpperCase();
     const hasArtwork = Boolean(artworkUrlFor(item));
-    return `<div class="media-art ${className} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}<span class="art-symbol">${icon(typeIcon(type))}</span><span class="art-time">${esc(duration)}</span></div>`;
+    return `<div class="media-art ${className} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}${artworkFallbackMarkup(item, 'symbol')}<span class="art-time">${esc(duration)}</span></div>`;
   }
 
   function setArtworkHost(host, item, baseClass) {
     if (!host) return;
     if (!item) {
+      const defaultArtAlreadyRendered = host.className === baseClass
+        && !host.hasAttribute('data-artwork-item-id')
+        && Boolean(host.querySelector(':scope > .vinyl-art'))
+        && !host.querySelector(':scope > img.artwork-image');
+      if (defaultArtAlreadyRendered) return;
       host.className = baseClass;
       host.removeAttribute('data-artwork-item-id');
-      host.innerHTML = `<span class="icon-slot">${icon('music')}</span>`;
+      host.innerHTML = vinylArtworkMarkup();
       return;
     }
-    const hasArtwork = Boolean(artworkUrlFor(item));
-    host.className = `${baseClass} ${artClass(item.type)} ${hasArtwork ? 'has-artwork' : ''}`;
-    host.setAttribute('data-artwork-item-id', cacheItem(item));
-    host.innerHTML = `${artworkImageMarkup(item)}<span class="icon-slot">${icon(typeIcon(item.type))}</span>`;
+    const id = cacheItem(item);
+    const url = artworkUrlFor(item);
+    const className = [baseClass, artClass(item.type), url ? 'has-artwork' : ''].filter(Boolean).join(' ');
+    const currentClassName = host.className.split(/\s+/).filter((name) => name !== 'artwork-loaded').join(' ');
+    const currentImage = host.querySelector(':scope > img.artwork-image');
+    const imageMatches = url ? currentImage?.getAttribute('src') === url : !currentImage;
+    if (host.dataset.artworkItemId === id && currentClassName === className && imageMatches) return;
+    host.className = className;
+    host.setAttribute('data-artwork-item-id', id);
+    host.innerHTML = `${artworkImageMarkup(item)}${artworkFallbackMarkup(item)}`;
   }
 
   function emptyPrompt(title, body, buttonText, kind) {
@@ -613,6 +896,7 @@
   }
 
   function renderHome() {
+    unwatchArtwork(byId('page-home'));
     const recent = state.recentPlayed.slice(0, 4);
     byId('recentGrid').innerHTML = recent.length ? recent.map((item) => {
       const id = cacheItem(item);
@@ -643,7 +927,7 @@
       byId('newlyGrid').innerHTML = newly.map((item) => {
         const id = cacheItem(item);
         const hasArtwork = Boolean(artworkUrlFor(item));
-        return `<article class="newly-card" data-item-id="${esc(id)}" tabindex="0" role="button" aria-label="Play ${esc(titleFor(item))}"><div class="newly-art ${artClass(item.type)} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}<span class="icon-slot">${icon(typeIcon(item.type))}</span></div><div class="newly-copy"><strong>${esc(titleFor(item))}</strong><span>${esc(typeLabel(item.type))} · ${esc(timeAgo(item.addedAt))}</span></div></article>`;
+        return `<article class="newly-card" data-item-id="${esc(id)}" tabindex="0" role="button" aria-label="Play ${esc(titleFor(item))}"><div class="newly-art ${artClass(item.type)} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}${artworkFallbackMarkup(item)}</div><div class="newly-copy"><strong>${esc(titleFor(item))}</strong><span>${esc(typeLabel(item.type))} · ${esc(timeAgo(item.addedAt))}</span></div></article>`;
       }).join('');
     } else {
       byId('newlyGrid').innerHTML = `<div class="newly-empty"><p>New music, videos and channels you discover will show up here — up to three at a time.</p><button class="text-button" data-pick-folder="music">Add music <span class="icon-slot">${icon('arrow-right')}</span></button><button class="text-button" data-pick-folder="video">Add videos <span class="icon-slot">${icon('arrow-right')}</span></button></div>`;
@@ -686,6 +970,7 @@
     const count = byId(kind === 'music' ? 'musicQueueCount' : 'videoQueueCount');
     const hint = byId(kind === 'music' ? 'musicDropHint' : 'videoDropHint');
     if (!list || !count || !hint) return;
+    unwatchArtwork(list);
     count.textContent = String(queue.length);
     hint.hidden = queue.length > 0;
     if (!queue.length) {
@@ -696,7 +981,7 @@
       const id = cacheItem(item);
       const current = currentItem && mediaId(currentItem) === id;
       const hasArtwork = Boolean(artworkUrlFor(item));
-      return `<div class="queue-item ${current ? 'is-current' : ''}" data-item-id="${esc(id)}" tabindex="0" role="button" aria-label="Play ${esc(titleFor(item))}"><span class="queue-index">${current && isPlaying ? icon('volume') : String(index + 1).padStart(2,'0')}</span><span class="queue-art ${artClass(item.type)} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}<span class="icon-slot">${icon(typeIcon(item.type))}</span></span><span class="queue-item-copy"><span class="queue-item-title">${esc(titleFor(item))}</span><span class="queue-item-subtitle">${esc(item.artist || item.extension || typeLabel(item.type))}</span></span><button class="queue-remove" data-remove-queue="${kind}" data-remove-id="${esc(id)}" aria-label="Remove ${esc(titleFor(item))}" title="Remove from queue"><span class="icon-slot">${icon('close')}</span></button></div>`;
+      return `<div class="queue-item ${current ? 'is-current' : ''}" data-item-id="${esc(id)}" tabindex="0" role="button" aria-label="Play ${esc(titleFor(item))}"><span class="queue-index">${current && isPlaying ? icon('volume') : String(index + 1).padStart(2,'0')}</span><span class="queue-art ${artClass(item.type)} ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}${artworkFallbackMarkup(item)}</span><span class="queue-item-copy"><span class="queue-item-title">${esc(titleFor(item))}</span><span class="queue-item-subtitle">${esc(item.artist || item.extension || typeLabel(item.type))}</span></span><button class="queue-remove" data-remove-queue="${kind}" data-remove-id="${esc(id)}" aria-label="Remove ${esc(titleFor(item))}" title="Remove from queue"><span class="icon-slot">${icon('close')}</span></button></div>`;
     }).join('');
     icons(list);
     watchArtwork(list);
@@ -706,6 +991,7 @@
     const query = (byId('channelSearch')?.value || '').trim().toLowerCase();
     const list = byId('tvChannelList');
     if (!list) return;
+    unwatchArtwork(list);
     const shown = tvChannels.filter((channel) => !query || `${channel.name} ${channel.country} ${channel.category} ${(channel.languages || []).join(' ')}`.toLowerCase().includes(query));
     byId('tvChannelCount').textContent = tvChannels.length ? String(tvChannels.length) : '—';
     if (!shown.length) {
@@ -910,9 +1196,7 @@
     if (!currentItem) {
       title.textContent = 'Nothing playing';
       subtitle.textContent = 'Choose music, video or a live channel.';
-      art.className = 'mini-art';
-      art.removeAttribute('data-artwork-item-id');
-      art.innerHTML = `<span class="icon-slot">${icon('music')}</span>`;
+      setArtworkHost(art, null, 'mini-art');
       byId('elapsedTime').textContent = '00:00';
       byId('durationTime').textContent = '00:00';
       byId('timeline').value = '0';
@@ -980,11 +1264,30 @@
     byId('tvTitleOverlay').textContent = isTv ? titleFor(currentItem) : 'No channel selected';
     byId('tvCenterPlay').setAttribute('aria-label', isPlaying ? 'Pause channel' : 'Play channel');
     byId('tvCenterPlay').innerHTML = `<span class="icon-slot">${icon(isPlaying ? 'pause' : 'play')}</span>`;
-    renderQueue('music');
-    renderQueue('video');
-    renderChannels();
-    icons(document);
-    watchArtwork(byId('page-music'));
+    const selectionKey = currentItem ? `${currentItem.type}:${mediaId(currentItem)}` : 'none';
+    const selectionChanged = selectionKey !== lastStageSelectionKey;
+    const playingChanged = isPlaying !== lastStagePlaying;
+    const currentType = currentItem?.type || '';
+    if (!stageListsInitialized) {
+      renderQueue('music');
+      renderQueue('video');
+      renderChannels();
+      stageListsInitialized = true;
+      icons(document);
+      watchArtwork(byId('page-music'));
+    } else if (selectionChanged) {
+      if (lastStageItemType === 'music' || currentType === 'music') renderQueue('music');
+      if (lastStageItemType === 'video' || currentType === 'video') renderQueue('video');
+      if (lastStageItemType === 'tv' || currentType === 'tv') renderChannels();
+      icons(document);
+      watchArtwork(byId('page-music'));
+    } else if (playingChanged) {
+      if (currentType === 'music') renderQueue('music');
+      else if (currentType === 'video') renderQueue('video');
+    }
+    lastStageSelectionKey = selectionKey;
+    lastStageItemType = currentType;
+    lastStagePlaying = isPlaying;
   }
   function updateTimeline() {
     const active = activeElement();
@@ -1016,14 +1319,15 @@
 
   function renderAll() {
     itemLookup = new Map();
+    stageListsInitialized = false;
+    lastStageSelectionKey = '';
+    lastStageItemType = '';
+    lastStagePlaying = false;
+    scheduleDetectedMusicArtwork();
     renderHome();
-    renderQueue('music');
-    renderQueue('video');
-    renderChannels();
     renderSettings();
     renderDevices();
     renderPlayerBar();
-    icons(document);
   }
 
   function toast(message, type = 'success', duration = 3200) {
@@ -1041,9 +1345,11 @@
     currentPage = page;
     document.querySelectorAll('.page').forEach((node) => {
       const active = node.id === `page-${page}`;
+      if (!active) unwatchArtwork(node);
       node.hidden = !active;
       node.classList.toggle('is-visible', active);
     });
+    watchArtwork(byId(`page-${page}`));
     document.querySelectorAll('.nav-item[data-page]').forEach((node) => node.classList.toggle('is-active', node.dataset.page === page));
     state.lastPage = page;
     persistState();
@@ -1086,6 +1392,7 @@
     }
     state.knownMedia[type] = [...new Set([...(state.knownMedia[type] || []), ...candidates.map(mediaId)])].slice(-5000);
     persistState();
+    if (type === 'music') scheduleDetectedMusicArtwork();
     renderHome();
     return { added: newItems, count: candidates.length };
   }
@@ -1134,6 +1441,7 @@
       return false;
     }
     setQueue(kind, [...queue, item]);
+    if (kind === 'music') scheduleDetectedMusicArtwork([item]);
     renderQueue(kind);
     persistState();
     return true;
@@ -1170,7 +1478,7 @@
     setQueue(kind, combined);
     addToLibrary(kind, additions, options.markNew !== false);
     if (!currentItem) selectItem(combined[0], false);
-    renderQueue(kind);
+    else renderQueue(kind);
     persistState();
     if (!options.quiet) toast(`${additions.length} ${kind === 'music' ? 'track' : 'video'}${additions.length === 1 ? '' : 's'} added to queue.`);
     if (allAdditions.length > additions.length) {
@@ -1230,8 +1538,9 @@
       let refreshedQueue = scanned;
       if (isShuffle && refreshedQueue.length > 1) refreshedQueue = shuffledQueueOrder(kind, refreshedQueue);
       setQueue(kind, refreshedQueue);
+      if (kind === 'music') scheduleDetectedMusicArtwork();
       if (!currentItem && refreshedQueue.length) selectItem(refreshedQueue[0], false);
-      renderQueue(kind);
+      else renderQueue(kind);
       persistState();
       if (scanned.length) toast(`${scanned.length.toLocaleString()} ${kind === 'music' ? 'tracks' : 'videos'} found. ${label} queue synced to the selected folder.`);
       else toast(`No supported ${kind === 'music' ? 'audio' : 'video'} files found. ${label} queue is empty.`);
@@ -1722,14 +2031,8 @@
         analyserBuffer = new Uint8Array(analyser.frequencyBinCount);
         equalizerFilters[equalizerFilters.length - 1].connect(analyser);
         reverbDryGain = audioContext.createGain();
-        reverbWetGain = audioContext.createGain();
-        reverbConvolver = audioContext.createConvolver();
-        reverbConvolver.buffer = createReverbImpulse(audioContext);
         analyser.connect(reverbDryGain);
         reverbDryGain.connect(audioContext.destination);
-        analyser.connect(reverbConvolver);
-        reverbConvolver.connect(reverbWetGain);
-        reverbWetGain.connect(audioContext.destination);
         applyAudioSettings();
       }
       musicDecks.forEach((deck, index) => {
@@ -1878,6 +2181,7 @@
     const input = byId('globalSearch');
     const resultsHost = byId('searchResults');
     if (!input || !resultsHost) return;
+    unwatchArtwork(resultsHost);
     const query = input.value.trim().toLowerCase();
     if (!query) { resultsHost.hidden = true; resultsHost.innerHTML = ''; return; }
     const all = [...(state.library.music || []), ...(state.library.video || []), ...state.musicQueue, ...state.videoQueue, ...state.recentPlayed, ...tvChannels.map(channelToItem)];
@@ -1891,7 +2195,7 @@
     resultsHost.innerHTML = matches.length ? matches.map((item) => {
       const id = cacheItem(item);
       const hasArtwork = Boolean(artworkUrlFor(item));
-      return `<button class="search-result" data-item-id="${esc(id)}"><span class="search-result-art ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}<span class="icon-slot">${icon(typeIcon(item.type))}</span></span><span class="search-result-copy"><strong>${esc(titleFor(item))}</strong><span>${esc(typeLabel(item.type))} · ${esc(itemSubtitle(item))}</span></span></button>`;
+      return `<button class="search-result" data-item-id="${esc(id)}"><span class="search-result-art ${hasArtwork ? 'has-artwork' : ''}" ${artworkAttributes(item)}>${artworkImageMarkup(item)}${artworkFallbackMarkup(item)}</span><span class="search-result-copy"><strong>${esc(titleFor(item))}</strong><span>${esc(typeLabel(item.type))} · ${esc(itemSubtitle(item))}</span></span></button>`;
     }).join('') : `<div class="search-empty">No matches yet. Add a folder or try a different search.</div>`;
     watchArtwork(resultsHost);
   }
@@ -2633,8 +2937,8 @@
 
   async function boot() {
     await loadPreferences();
+    await syncWindowAppearance();
     applySettings();
-    syncWindowAppearance();
     bindEvents();
     renderAll();
     document.body.dataset.mode = resolveMode();
@@ -2664,5 +2968,6 @@
     if (stored?.currentItem) currentItem = stored.currentItem;
   } catch { /* nothing to restore */ }
 
+  resetStaleMusicArtworkOnce();
   boot();
 })();

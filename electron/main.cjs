@@ -77,6 +77,15 @@ function queueAssociatedMediaFiles(args) {
 }
 const sidecarDirectoryCache = new Map();
 const embeddedArtworkCache = new Map();
+const MAX_SIDECAR_CACHE_DIRECTORIES = 64;
+const MAX_SIDECAR_IMAGES_PER_DIRECTORY = 1024;
+const MAX_EMBEDDED_ARTWORK_CACHE_ENTRIES = 512;
+
+function cacheLruValue(cache, key, value, limit) {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) cache.delete(cache.keys().next().value);
+}
 
 function userDataPath(name) {
   return path.join(app.getPath('userData'), name);
@@ -341,28 +350,64 @@ function startExternalStorageWatcher() {
 }
 
 async function imageDirectoryMap(directory) {
-  if (sidecarDirectoryCache.has(directory)) return sidecarDirectoryCache.get(directory);
-  const pending = fs.readdir(directory, { withFileTypes: true }).then((entries) => {
+  if (sidecarDirectoryCache.has(directory)) {
+    const cached = sidecarDirectoryCache.get(directory);
+    sidecarDirectoryCache.delete(directory);
+    sidecarDirectoryCache.set(directory, cached);
+    return cached;
+  }
+  const pending = (async () => {
     const images = new Map();
-    for (const entry of entries) {
-      if (!entry.isFile() || !IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
-      images.set(entry.name.toLowerCase(), path.join(directory, entry.name));
+    let truncated = false;
+    let directoryHandle;
+    try {
+      directoryHandle = await fs.opendir(directory);
+      for await (const entry of directoryHandle) {
+        if (!entry.isFile() || !IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+        if (images.size >= MAX_SIDECAR_IMAGES_PER_DIRECTORY) {
+          truncated = true;
+          break;
+        }
+        images.set(entry.name.toLowerCase(), path.join(directory, entry.name));
+      }
+    } catch {
+      truncated = true;
     }
-    return images;
-  }).catch(() => new Map());
-  sidecarDirectoryCache.set(directory, pending);
-  if (sidecarDirectoryCache.size > 256) sidecarDirectoryCache.delete(sidecarDirectoryCache.keys().next().value);
+    return { images, truncated };
+  })();
+  cacheLruValue(sidecarDirectoryCache, directory, pending, MAX_SIDECAR_CACHE_DIRECTORIES);
   return pending;
 }
 
 async function findSidecarArtwork(filePath) {
   const directory = path.dirname(filePath);
   const mediaBase = path.basename(filePath, path.extname(filePath)).toLowerCase();
-  const images = await imageDirectoryMap(directory);
+  const { images, truncated } = await imageDirectoryMap(directory);
   const names = [mediaBase, 'cover', 'folder', 'front', 'albumart', 'album', 'artwork', 'poster', 'thumbnail', 'thumb'];
+  if (!truncated) {
+    for (const base of names) {
+      for (const extension of IMAGE_EXTENSIONS) {
+        const found = images.get(`${base}${extension}`);
+        if (found) return pathToFileURL(found).href;
+      }
+    }
+    return '';
+  }
+
+  const wantedNames = new Set();
+  for (const base of names) for (const extension of IMAGE_EXTENSIONS) wantedNames.add(`${base}${extension}`);
+  const foundNames = new Map();
+  try {
+    const directoryHandle = await fs.opendir(directory);
+    for await (const entry of directoryHandle) {
+      if (!entry.isFile() || !IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+      const lowerName = entry.name.toLowerCase();
+      if (wantedNames.has(lowerName) && !foundNames.has(lowerName)) foundNames.set(lowerName, path.join(directory, entry.name));
+    }
+  } catch { return ''; }
   for (const base of names) {
     for (const extension of IMAGE_EXTENSIONS) {
-      const found = images.get(`${base}${extension}`);
+      const found = foundNames.get(`${base}${extension}`);
       if (found) return pathToFileURL(found).href;
     }
   }
@@ -373,7 +418,11 @@ async function getEmbeddedArtwork(filePath) {
   const stat = await fs.stat(filePath).catch(() => null);
   if (!stat?.isFile() || stat.size > 1024 * 1024 * 1024) return '';
   const cacheKey = `${filePath}:${stat.size}:${stat.mtimeMs}`;
-  if (embeddedArtworkCache.has(cacheKey)) return embeddedArtworkCache.get(cacheKey) || '';
+  if (embeddedArtworkCache.has(cacheKey)) {
+    const cached = embeddedArtworkCache.get(cacheKey) || '';
+    cacheLruValue(embeddedArtworkCache, cacheKey, cached, MAX_EMBEDDED_ARTWORK_CACHE_ENTRIES);
+    return cached;
+  }
   try {
     musicMetadataModule ||= import('music-metadata');
     const { parseFile } = await musicMetadataModule;
@@ -382,10 +431,10 @@ async function getEmbeddedArtwork(filePath) {
     const bytes = picture?.data ? Buffer.from(picture.data) : null;
     const extension = ARTWORK_TYPES.get(String(picture?.format || '').toLowerCase());
     if (!bytes?.length || bytes.length > 5 * 1024 * 1024 || !extension) {
-      embeddedArtworkCache.set(cacheKey, '');
+      cacheLruValue(embeddedArtworkCache, cacheKey, '', MAX_EMBEDDED_ARTWORK_CACHE_ENTRIES);
       return '';
     }
-    const filename = `${crypto.createHash('sha1').update(filePath).update(bytes).digest('hex')}${extension}`;
+    const filename = `${crypto.createHash('sha1').update(bytes).digest('hex')}${extension}`;
     const cacheDirectory = userDataPath('artwork-cache');
     await fs.mkdir(cacheDirectory, { recursive: true });
     const cachePath = path.join(cacheDirectory, filename);
@@ -393,10 +442,10 @@ async function getEmbeddedArtwork(filePath) {
       if (error?.code !== 'EEXIST') throw error;
     });
     const url = `revibe://artwork/${filename}`;
-    embeddedArtworkCache.set(cacheKey, url);
+    cacheLruValue(embeddedArtworkCache, cacheKey, url, MAX_EMBEDDED_ARTWORK_CACHE_ENTRIES);
     return url;
   } catch {
-    embeddedArtworkCache.set(cacheKey, '');
+    cacheLruValue(embeddedArtworkCache, cacheKey, '', MAX_EMBEDDED_ARTWORK_CACHE_ENTRIES);
     return '';
   }
 }
@@ -732,18 +781,21 @@ function getDwmCapabilities() {
       dwmEnabled = build >= 10240 || aeroGlassProbe;
     } catch { dwmEnabled = build >= 10240; }
   }
-  // Windows 11 has DWM corner support on build 22000+, regardless of the
-  // legacy Aero-glass probe (which can report false on newer Windows builds).
+  // Frameless windows can request native DWM corners on Windows 11.
   const supportsRoundedCorners = process.platform === 'win32' && build >= 22000;
-  // Use a tiny CSS radius for a nearly square silhouette. Opt out of the
-  // larger Windows 11 native curve so it cannot mismatch the renderer edge.
-  const windowCornerStyle = process.platform === 'win32' ? 'rounded' : 'square';
+  // On Windows 11 22H2+, use the native, non-layered surface so DWM can draw
+  // both the system backdrop and its real outer corner mask. Older Windows
+  // keeps the existing transparent surface instead of losing its translucency.
+  const supportsBackdropMaterial = process.platform === 'win32' && dwmEnabled && build >= 22621;
+  const usesNativeRoundedSurface = supportsRoundedCorners && supportsBackdropMaterial;
+  const windowCornerStyle = usesNativeRoundedSurface ? 'native-rounded' : (process.platform === 'win32' ? 'rounded' : 'square');
   return {
     platform: process.platform,
     windowsBuild: build,
     dwmEnabled,
     supportsRoundedCorners,
-    supportsBackdropMaterial: process.platform === 'win32' && dwmEnabled && build >= 22621,
+    supportsBackdropMaterial,
+    usesNativeRoundedSurface,
     windowCornerStyle
   };
 }
@@ -771,7 +823,13 @@ async function createWindow() {
   mediaDiscoveryEnabled = savedSettings.mediaDiscoveryEnabled === true;
   const dwm = getDwmCapabilities();
   const startMode = ['dark', 'light'].includes(savedSettings.theme) ? savedSettings.theme : (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
-  const transparent = process.platform !== 'win32' || dwm.dwmEnabled;
+  const usesNativeRoundedSurface = dwm.usesNativeRoundedSurface === true;
+  // Keep transparent rendering on platforms without the supported native
+  // backdrop. On Windows 11 22H2+, let DWM own the material and outer corners.
+  const transparent = process.platform !== 'win32' || (dwm.dwmEnabled && !usesNativeRoundedSurface);
+  const backgroundColor = transparent || usesNativeRoundedSurface
+    ? '#00000000'
+    : (startMode === 'dark' ? '#161719' : '#f7fbf9');
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -780,9 +838,9 @@ async function createWindow() {
     show: false,
     frame: false,
     transparent,
-    backgroundColor: transparent ? '#00000000' : (startMode === 'dark' ? '#161719' : '#f7fbf9'),
+    backgroundColor,
     backgroundMaterial: materialForMode(startMode, dwm),
-    roundedCorners: false,
+    roundedCorners: dwm.supportsRoundedCorners,
     autoHideMenuBar: true,
     title: 'Revibe Media Centre',
     icon: path.join(__dirname, '..', 'assets', 'app-icon.ico'),
