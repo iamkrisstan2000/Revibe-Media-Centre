@@ -4,6 +4,23 @@ A local-first desktop app for your music, videos, and an optional guide to commu
 
 **Version:** 1.1.0 · **License:** GPL-3.0-only
 
+
+## Screenshots 
+
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204139" src="https://github.com/user-attachments/assets/1b5b80d5-4db1-47c7-bf1b-0cee94eb97c7" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204122" src="https://github.com/user-attachments/assets/4130bccd-83ad-499d-833c-02cbef9b2ff7" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204112" src="https://github.com/user-attachments/assets/652383d4-b6d7-4ee3-b926-2022cd5325aa" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204100" src="https://github.com/user-attachments/assets/3c861ea8-57e5-40da-86a7-f5ed75618a0d" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204054" src="https://github.com/user-attachments/assets/d55faf73-ead4-4a81-a0fa-26a3cf6fe1de" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204048" src="https://github.com/user-attachments/assets/eb63a95d-5f4b-4b29-af4c-7f49c4a4f3f8" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204027" src="https://github.com/user-attachments/assets/4bd93806-7071-4985-b6f9-ed8e41ff8272" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 204014" src="https://github.com/user-attachments/assets/ff0eb736-8fee-45b5-bb51-4f37098a4486" />
+<img width="1918" height="1067" alt="Screenshot 2026-10-21 204009" src="https://github.com/user-attachments/assets/3fc82d65-4a44-4ae2-890b-178fbb0f9360" />
+<img width="1916" height="1076" alt="Screenshot 2026-10-21 204004" src="https://github.com/user-attachments/assets/4a391342-2e6d-42d0-8a03-3329725e1f8b" />
+<img width="1919" height="1070" alt="Screenshot 2026-10-21 204000" src="https://github.com/user-attachments/assets/caec0063-0aae-4789-8091-e738545d04fd" />
+<img width="1919" height="1079" alt="Screenshot 2026-10-21 203955" src="https://github.com/user-attachments/assets/f5b7f03a-67c3-4e05-858d-c5be1aaad9b0" />
+
+
 Enjoying Revibe? [Give the project a little support on Ko-fi](https://ko-fi.com/N7D7292WUD) ☕ It helps keep the app maintained—thank you!
 
 ## Features
